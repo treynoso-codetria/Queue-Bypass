@@ -3,12 +3,13 @@
 //
 // Usage:
 //   node open-browsers.js [--chrome N] [--edge N] [--brave N] [--opera N] [--firefox N]
-//                         [--private N] [--url URL] [--screen WxH+X+Y]
+//                         [--private N] [--url URL] [--screen WxH+X+Y] [--keep-all]
 //
 //   --<browser> N     normal windows for that browser (default 1, 0 to skip the browser)
 //   --private N       incognito/private windows per browser (default 1, 0 to disable)
 //   --screen WxH+X+Y  area to tile the windows over (default: the primary monitor's usable
 //                     area, detected with xrandr / _NET_WORKAREA)
+//   --keep-all        don't close the other windows when one gets through the queue
 //
 // Example:
 //   node open-browsers.js --chrome 3 --opera 0 --private 2
@@ -19,11 +20,15 @@
 // GNOME decides where they go: Firefox crashes under XWayland here, and native Wayland windows
 // can't choose their position.
 //
+// Queue watch: once a window goes from the Queue-it waiting room to the Boca site, every other
+// window is closed so only one session keeps polling the site's API (which blocks IPs that
+// poll too much). Firefox private windows can't be watched, but they do get closed.
+//
 // Windows stay open until you press Ctrl+C.
 
 import { chromium, firefox } from "playwright";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 
@@ -101,6 +106,10 @@ const CHROMIUM_ARGS = [
 // ~660, Chrome/Edge/Brave are ~530-570). Used to pick a UI scale that lets windows fit a cell.
 const CHROMIUM_MIN_WIDTH = 680;
 
+// A window that goes from QUEUE_HOST to SITE_HOST has gotten through the queue.
+const QUEUE_HOST = "bocajuniors.queue-it.net";
+const SITE_HOST = "bocasocios.bocajuniors.com.ar";
+
 // Throwaway profiles, deleted on exit.
 const PROFILES_DIR = join(import.meta.dirname, ".profiles");
 
@@ -118,6 +127,7 @@ const { values } = parseArgs({
       default: "https://bocasocios.bocajuniors.com.ar/home",
     },
     screen: { type: "string" },
+    "keep-all": { type: "boolean", default: false },
   },
 });
 
@@ -216,6 +226,8 @@ function writeFirefoxProfile(profile, { width, height }) {
 
 const launched = []; // Playwright browsers / persistent contexts (anything with close())
 const privateProcs = []; // spawned private-window processes
+// Every window, for the queue watch: { label, pages() -> [[key, url]], close() }
+const windows = [];
 
 async function openNormalWindows(name, count) {
   const { engine } = BROWSERS[name];
@@ -241,13 +253,17 @@ async function openNormalWindows(name, count) {
 
   await Promise.all(
     Array.from({ length: count }, async (_, i) => {
+      const label = `${name} #${i + 1}`;
       const context = await browser.newContext({ viewport: null });
       const page = await context.newPage();
+      windows.push({
+        label,
+        pages: async () => context.pages().map((p) => [p, p.url()]),
+        close: () => context.close(),
+      });
 
       // Move/resize this context's window through the DevTools protocol.
-      const { x, y, width, height } = toUiUnits(
-        grid.cells[`${name} #${i + 1}`],
-      );
+      const { x, y, width, height } = toUiUnits(grid.cells[label]);
       const cdp = await context.newCDPSession(page);
       const { windowId } = await cdp.send("Browser.getWindowForTarget");
       await cdp.send("Browser.setWindowBounds", {
@@ -256,7 +272,7 @@ async function openNormalWindows(name, count) {
       });
 
       await page.goto(values.url);
-      console.log(`[${name} #${i + 1}] opened ${values.url}`);
+      console.log(`[${label}] opened ${values.url}`);
     }),
   );
 }
@@ -284,6 +300,11 @@ async function openFirefoxNormalWindows(count) {
         return;
       }
       launched.push(context);
+      windows.push({
+        label,
+        pages: async () => context.pages().map((p) => [p, p.url()]),
+        close: () => context.close(),
+      });
 
       const page = context.pages()[0] ?? (await context.newPage());
       await page.goto(values.url);
@@ -302,15 +323,29 @@ function openPrivateWindows(name, count) {
     const args = privateArgs(profile, values.url);
     if (engine === chromium) {
       mkdirSync(profile, { recursive: true });
+      rmSync(join(profile, "DevToolsActivePort"), { force: true });
       const { x, y, width, height } = toUiUnits(grid.cells[label]);
+      // Port 0 picks a free DevTools port and writes it to <profile>/DevToolsActivePort,
+      // which lets the queue watch read this window's tabs.
       args.unshift(
         ...CHROMIUM_ARGS,
+        "--remote-debugging-port=0",
         `--force-device-scale-factor=${chromiumScale}`,
         `--window-position=${x},${y}`,
         `--window-size=${width},${height}`,
       );
+      windows.push({
+        label,
+        pages: () => devToolsPages(profile),
+        close: () => killProfile(profile),
+      });
     } else {
       writeFirefoxProfile(profile, grid);
+      windows.push({
+        label,
+        pages: async () => [],
+        close: () => killProfile(profile),
+      });
     }
 
     const proc = spawn(command, args, { detached: true, stdio: "ignore" });
@@ -319,6 +354,61 @@ function openPrivateWindows(name, count) {
     );
     proc.on("spawn", () => console.log(`[${label}] opened ${values.url}`));
     privateProcs.push(proc);
+  }
+}
+
+// Tabs of a private Chromium window, read from its DevTools HTTP endpoint.
+async function devToolsPages(profile) {
+  try {
+    const port = readFileSync(join(profile, "DevToolsActivePort"), "utf8")
+      .split("\n")[0];
+    const res = await fetch(`http://127.0.0.1:${port}/json/list`);
+    const targets = await res.json();
+    return targets
+      .filter((t) => t.type === "page")
+      .map((t) => [t.id, t.url]);
+  } catch {
+    return []; // not started yet, or already gone
+  }
+}
+
+// Kills the processes using this profile. The trailing "( |$)" keeps "chrome-private-1" from
+// also matching "chrome-private-10".
+function killProfile(profile) {
+  const escaped = profile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  spawnSync("pkill", ["-TERM", "-f", `${escaped}( |$)`]);
+}
+
+function hostOf(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "";
+  }
+}
+
+// Polls every window's tabs until one goes from the Queue-it waiting room to the Boca site,
+// then closes all the other windows.
+async function watchQueue() {
+  const queued = new Set(); // keys of tabs that have been on QUEUE_HOST
+  for (;;) {
+    for (const win of windows) {
+      for (const [key, url] of await win.pages()) {
+        const host = hostOf(url);
+        if (host === QUEUE_HOST) {
+          queued.add(key);
+        } else if (host === SITE_HOST && queued.has(key)) {
+          console.log(
+            `[${win.label}] got through the queue, closing the other windows...`,
+          );
+          const others = windows.filter((w) => w !== win);
+          await Promise.allSettled(others.map((w) => w.close()));
+          console.log(`Only [${win.label}] is left open.`);
+          return;
+        }
+      }
+    }
+    await new Promise((r) => setTimeout(r, 1000));
   }
 }
 
@@ -380,3 +470,4 @@ if (launched.length === 0 && privateProcs.length === 0) {
   process.exit(1);
 }
 console.log("All windows opened. Press Ctrl+C to close them.");
+if (!values["keep-all"]) watchQueue();
