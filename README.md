@@ -62,6 +62,31 @@ Qué pasa realmente:
 - **Afecta a todas las ventanas a la vez,** porque todas salen por la misma IP pública.
 - **El umbral es desconocido.** Lo configura Boca y puede cambiar, sobre todo en días de venta. El WAF cuenta todo el tráfico hacia sus hosts, no solo `validate`: carga de páginas, assets y demás endpoints.
 
+## Bloqueo de los endpoints de asientos
+
+También se observó un bloqueo distinto, más acotado, **usando un solo navegador**. Al abrir una sección de plateas (`/matches/<evento>/plateas/seats/<sección>`), la página llama a dos endpoints:
+
+- `GET /event/seat/section/<sección>/locations`: el mapa de asientos de la sección.
+- `GET /event/seat/section/<sección>/availability`: qué asientos están libres.
+
+Esos dos devolvieron `418` en el preflight, igual que antes. Pero **en el mismo segundo y desde la misma IP**, otras peticiones respondían bien: `/event/<evento>/seat/section/availability` (disponibilidad general de todas las secciones) y `/member/shoppingCart/<evento>`. Las respuestas 418 traen `server: CloudWAF` y tardan ~530 ms, contra ~30 ms de las que pasan.
+
+Conclusiones:
+
+- **No es un bloqueo de toda la IP:** el WAF está limitando solo los endpoints de una sección de asientos, los más costosos para el servidor.
+- **La página reintenta sola** (a los ~1,5 s, 2,5 s y 4,5 s), y cada reintento cuenta para el límite.
+- **No sabemos la causa exacta.** Hay tres posibilidades:
+  - un límite por IP con umbral bajo en esos endpoints (por ejemplo, después de entrar y salir de varias secciones);
+  - una **IP compartida (CGNAT)**: muchos proveedores en Argentina comparten la misma IP pública entre muchos clientes, así que otros usuarios suman al mismo contador;
+  - una regla general que Boca aplica a todos cuando el servidor está saturado.
+
+Qué hacer:
+
+- **Dejá de tocar esa sección y no recargues.** Volvé al listado y esperá unos minutos: cada intento extiende el bloqueo.
+- **Tené una sola pestaña del sitio abierta.**
+- **Entrá directo a la sección que te interesa**, en vez de recorrer varias.
+- **Para saber si el problema es tuyo o general,** pedile a alguien con otra conexión que abra la misma sección al mismo tiempo. Si a esa persona le anda, el límite es por IP (tuya o compartida). Si a esa persona también le falla, el problema es del sistema.
+
 ## Cómo evitar el bloqueo
 
 1. **Una sola sesión después de la fila, como máximo dos.** Pasada la fila, todas las ventanas ven el mismo stock: más sesiones consultando no consiguen entradas antes, solo suman tráfico. Si salta el bloqueo, caen todas, incluida la buena.
@@ -80,4 +105,4 @@ Qué pasa realmente:
 
 ## Seguridad de la cuenta
 
-El header `Authorization: Bearer ...` que se ve en las herramientas de desarrollador es una credencial válida por ~24 h: contiene tu email y número de socio. Al compartir capturas o comandos `curl`, borralo antes. Si se filtró, cerrá sesión en el sitio.
+El header `Authorization: Bearer ...` que se ve en las herramientas de desarrollador es una credencial válida por ~24 h: contiene tu email y número de socio. Al compartir capturas o comandos `curl`, borralo antes. Los archivos HAR exportados del navegador lo incluyen en cada petición, junto con todas las cookies de sesión (también las de Queue-it): no los compartas. Si se filtró, cerrá sesión en el sitio.
