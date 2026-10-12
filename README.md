@@ -29,6 +29,9 @@ node open-browsers.js --keep-all            # no cerrar las demás al pasar la f
 | `--url URL` | URL inicial (por defecto `https://bocasocios.bocajuniors.com.ar/home`) |
 | `--screen WxH+X+Y` | Área de pantalla para la grilla (por defecto se detecta sola) |
 | `--keep-all` | Desactiva el cierre automático de ventanas |
+| `--keep-best N` | Cada minuto, cierra las ventanas en fila salvo las N con menor espera |
+| `--max-wait M` | Cada minuto, cierra las ventanas en fila con más de M minutos de espera |
+| `--dump-queue` | Guarda el texto de la página de la fila de cada ventana en `queue-dumps/` |
 
 `Ctrl+C` cierra todas las ventanas y borra los perfiles temporales de `.profiles/`.
 
@@ -95,6 +98,24 @@ Qué hacer:
 4. **No abras demasiadas ventanas a la vez.** La carga inicial de cada ventana también pasa por los hosts de Boca. Si aparece un 418 apenas arrancás, la causa es esa: abrí menos.
 5. **Si aparece un 418, bajá la carga enseguida.** Cerrá ventanas. Seguir consultando durante el bloqueo probablemente lo extienda.
 6. **Evitá comprar en paralelo con la misma cuenta.** Lo más probable es que el sistema permita un solo pedido por socio, y varias ventanas comprando pueden pisarse.
+
+## Ranking de la fila (experimental)
+
+Cada minuto, el script lee el tiempo estimado que muestra Queue-it en cada ventana ("Entrarás a la página web dentro de: 34 minutos") y muestra una tabla ordenada de menor a mayor:
+
+```
+Estimated wait per window:
+   1. brave private #1     3 min
+   2. chrome #1            12 min
+   3. edge private #1      34 min
+   -. firefox private #1   unknown
+```
+
+- **No genera tráfico:** solo lee el texto de páginas que ya están cargadas, sin peticiones extra a Queue-it ni a Boca.
+- **Con `--keep-best N` o `--max-wait M`** cierra las ventanas con más espera. Nunca cierra la de menor espera, ni las que muestran `unknown`. Conviene `--keep-best 2` o más: la estimación de Queue-it varía y la fila no siempre avanza parejo.
+- **El parser todavía no se probó contra una fila real.** Está escrito para el formato "dentro de: X minutos" y sus variantes con horas ("1 hora y 5 minutos", "más de una hora", "menos de un minuto"). Si una ventana muestra otro formato, aparece como `unknown` y en la terminal se imprime el texto que no pudo interpretar.
+- **En el próximo evento, corré con `--dump-queue`.** Así se guarda el texto real de cada fila en `queue-dumps/` (ignorado por git) y se puede ajustar `parseWaitMinutes` en `open-browsers.js`. Esos archivos pueden incluir el ID de tu lugar en la fila: no los compartas.
+- Firefox privado siempre aparece como `unknown`, por la misma razón que no puede ganar en el cierre automático.
 
 ## Limitaciones del cierre automático
 

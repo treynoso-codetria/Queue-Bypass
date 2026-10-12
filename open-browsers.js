@@ -4,12 +4,16 @@
 // Usage:
 //   node open-browsers.js [--chrome N] [--edge N] [--brave N] [--opera N] [--firefox N]
 //                         [--private N] [--url URL] [--screen WxH+X+Y] [--keep-all]
+//                         [--keep-best N] [--max-wait M] [--dump-queue]
 //
 //   --<browser> N     normal windows for that browser (default 1, 0 to skip the browser)
 //   --private N       incognito/private windows per browser (default 1, 0 to disable)
 //   --screen WxH+X+Y  area to tile the windows over (default: the primary monitor's usable
 //                     area, detected with xrandr / _NET_WORKAREA)
 //   --keep-all        don't close the other windows when one gets through the queue
+//   --keep-best N     every minute, close all queued windows but the N with the shortest wait
+//   --max-wait M      every minute, close queued windows whose wait is over M minutes
+//   --dump-queue      save each window's queue page text to queue-dumps/ (to tune the parser)
 //
 // Example:
 //   node open-browsers.js --chrome 3 --opera 0 --private 2
@@ -23,6 +27,10 @@
 // Queue watch: once a window goes from the Queue-it waiting room to the Boca site, every other
 // window is closed so only one session keeps polling the site's API (which blocks IPs that
 // poll too much). Firefox private windows can't be watched, but they do get closed.
+//
+// Queue ranking: every minute, the estimated wait shown on each window's Queue-it page is read
+// and printed as a table, shortest first. It only reads pages already loaded, so it adds no
+// requests. --keep-best / --max-wait use it to close the windows with the longest waits.
 //
 // Windows stay open until you press Ctrl+C.
 
@@ -113,6 +121,12 @@ const SITE_HOST = "bocasocios.bocajuniors.com.ar";
 // Throwaway profiles, deleted on exit.
 const PROFILES_DIR = join(import.meta.dirname, ".profiles");
 
+// Where --dump-queue saves the queue page texts. Git-ignored, kept after exit.
+const DUMPS_DIR = join(import.meta.dirname, "queue-dumps");
+
+// How often the queue ranking reads the windows. Queue-it updates its estimate every minute.
+const RANK_INTERVAL_MS = 60_000;
+
 const { values } = parseArgs({
   options: {
     ...Object.fromEntries(
@@ -128,8 +142,13 @@ const { values } = parseArgs({
     },
     screen: { type: "string" },
     "keep-all": { type: "boolean", default: false },
+    "keep-best": { type: "string" },
+    "max-wait": { type: "string" },
+    "dump-queue": { type: "boolean", default: false },
   },
 });
+const keepBest = positiveFlag("keep-best");
+const maxWait = positiveFlag("max-wait");
 
 // Returns the area to tile windows over as { x, y, width, height }.
 function detectScreen() {
@@ -226,8 +245,29 @@ function writeFirefoxProfile(profile, { width, height }) {
 
 const launched = []; // Playwright browsers / persistent contexts (anything with close())
 const privateProcs = []; // spawned private-window processes
-// Every window, for the queue watch: { label, pages() -> [[key, url]], close() }
+// Every open window, for the queue watch and ranking:
+//   { label, pages() -> [[key, url]], queueText() -> string | null, close() }
 const windows = [];
+let queuePassed = false; // set once a window gets through the queue
+
+function trackPlaywrightWindow(label, context) {
+  windows.push({
+    label,
+    pages: async () => context.pages().map((p) => [p, p.url()]),
+    queueText: async () => {
+      const page = context.pages().find((p) => hostOf(p.url()) === QUEUE_HOST);
+      return page
+        ? page.innerText("body", { timeout: 5000 }).catch(() => null)
+        : null;
+    },
+    close: () => context.close(),
+  });
+}
+
+function closeWindow(win) {
+  windows.splice(windows.indexOf(win), 1);
+  return win.close();
+}
 
 async function openNormalWindows(name, count) {
   const { engine } = BROWSERS[name];
@@ -256,11 +296,7 @@ async function openNormalWindows(name, count) {
       const label = `${name} #${i + 1}`;
       const context = await browser.newContext({ viewport: null });
       const page = await context.newPage();
-      windows.push({
-        label,
-        pages: async () => context.pages().map((p) => [p, p.url()]),
-        close: () => context.close(),
-      });
+      trackPlaywrightWindow(label, context);
 
       // Move/resize this context's window through the DevTools protocol.
       const { x, y, width, height } = toUiUnits(grid.cells[label]);
@@ -300,11 +336,7 @@ async function openFirefoxNormalWindows(count) {
         return;
       }
       launched.push(context);
-      windows.push({
-        label,
-        pages: async () => context.pages().map((p) => [p, p.url()]),
-        close: () => context.close(),
-      });
+      trackPlaywrightWindow(label, context);
 
       const page = context.pages()[0] ?? (await context.newPage());
       await page.goto(values.url);
@@ -336,7 +368,9 @@ function openPrivateWindows(name, count) {
       );
       windows.push({
         label,
-        pages: () => devToolsPages(profile),
+        pages: async () =>
+          (await devToolsTargets(profile)).map((t) => [t.id, t.url]),
+        queueText: () => devToolsQueueText(profile),
         close: () => killProfile(profile),
       });
     } else {
@@ -344,6 +378,7 @@ function openPrivateWindows(name, count) {
       windows.push({
         label,
         pages: async () => [],
+        queueText: async () => null,
         close: () => killProfile(profile),
       });
     }
@@ -358,18 +393,47 @@ function openPrivateWindows(name, count) {
 }
 
 // Tabs of a private Chromium window, read from its DevTools HTTP endpoint.
-async function devToolsPages(profile) {
+async function devToolsTargets(profile) {
   try {
     const port = readFileSync(join(profile, "DevToolsActivePort"), "utf8")
       .split("\n")[0];
     const res = await fetch(`http://127.0.0.1:${port}/json/list`);
     const targets = await res.json();
-    return targets
-      .filter((t) => t.type === "page")
-      .map((t) => [t.id, t.url]);
+    return targets.filter((t) => t.type === "page");
   } catch {
     return []; // not started yet, or already gone
   }
+}
+
+// Text of a private Chromium window's Queue-it tab, read through the DevTools protocol.
+async function devToolsQueueText(profile) {
+  const target = (await devToolsTargets(profile)).find(
+    (t) => hostOf(t.url) === QUEUE_HOST,
+  );
+  if (!target) return null;
+
+  return new Promise((resolve) => {
+    const ws = new WebSocket(target.webSocketDebuggerUrl);
+    const done = (value) => {
+      clearTimeout(timer);
+      ws.close();
+      resolve(value);
+    };
+    const timer = setTimeout(() => done(null), 5000);
+    ws.onopen = () =>
+      ws.send(
+        JSON.stringify({
+          id: 1,
+          method: "Runtime.evaluate",
+          params: { expression: "document.body.innerText", returnByValue: true },
+        }),
+      );
+    ws.onmessage = ({ data }) => {
+      const msg = JSON.parse(data);
+      if (msg.id === 1) done(msg.result?.result?.value ?? null);
+    };
+    ws.onerror = () => done(null);
+  });
 }
 
 // Kills the processes using this profile. The trailing "( |$)" keeps "chrome-private-1" from
@@ -392,7 +456,7 @@ function hostOf(url) {
 async function watchQueue() {
   const queued = new Set(); // keys of tabs that have been on QUEUE_HOST
   for (;;) {
-    for (const win of windows) {
+    for (const win of [...windows]) {
       for (const [key, url] of await win.pages()) {
         const host = hostOf(url);
         if (host === QUEUE_HOST) {
@@ -401,14 +465,95 @@ async function watchQueue() {
           console.log(
             `[${win.label}] got through the queue, closing the other windows...`,
           );
+          queuePassed = true;
           const others = windows.filter((w) => w !== win);
-          await Promise.allSettled(others.map((w) => w.close()));
+          await Promise.allSettled(others.map(closeWindow));
           console.log(`Only [${win.label}] is left open.`);
           return;
         }
       }
     }
     await new Promise((r) => setTimeout(r, 1000));
+  }
+}
+
+// Turns Queue-it's estimated wait into minutes, or null if the text has none. Expects wording
+// like "Entrarás a la página web dentro de: 34 minutos" (or "1 hora y 5 minutos", "menos de un
+// minuto"). Not yet checked against a live queue: run with --dump-queue to collect real texts.
+function parseWaitMinutes(text) {
+  const plain = text
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // strip accents
+    .toLowerCase();
+  const estimate = /dentro de:?\s*([\s\S]{0,60})/.exec(plain)?.[1];
+  if (!estimate) return null;
+  if (/menos de (un|1) minuto/.test(estimate)) return 0;
+
+  const count = (word) => (/^\d+$/.test(word) ? Number(word) : 1); // "un"/"una" = 1
+  const hours = /\b(\d+|una?)\s*horas?\b/.exec(estimate);
+  const minutes = /\b(\d+|un)\s*minutos?\b/.exec(estimate);
+  if (!hours && !minutes) return null;
+  return (hours ? count(hours[1]) * 60 : 0) + (minutes ? count(minutes[1]) : 0);
+}
+
+// Value of a numeric flag, Infinity when it's not given. Exits on anything but a number >= 1.
+function positiveFlag(name) {
+  if (values[name] === undefined) return Infinity;
+  const n = Number(values[name]);
+  if (!(n >= 1)) {
+    console.error(`--${name} must be a number >= 1, got "${values[name]}"`);
+    process.exit(1);
+  }
+  return n;
+}
+
+// Every RANK_INTERVAL_MS, reads the estimated wait of each window still in the queue, prints
+// them shortest first, and applies --keep-best / --max-wait.
+async function rankQueue() {
+  const warned = new Set(); // windows whose text couldn't be parsed, warned once
+
+  while (!queuePassed) {
+    await new Promise((r) => setTimeout(r, RANK_INTERVAL_MS));
+    if (queuePassed) return;
+
+    const rows = await Promise.all(
+      windows.map(async (win) => {
+        const text = await win.queueText().catch(() => null);
+        if (text && values["dump-queue"]) {
+          mkdirSync(DUMPS_DIR, { recursive: true });
+          writeFileSync(join(DUMPS_DIR, `${win.label}.txt`), text);
+        }
+        const wait = text === null ? null : parseWaitMinutes(text);
+        if (text !== null && wait === null && !warned.has(win)) {
+          warned.add(win);
+          const snippet = text.replace(/\s+/g, " ").slice(0, 200);
+          console.warn(`[${win.label}] couldn't find the wait time in: "${snippet}"`);
+        }
+        return { win, wait };
+      }),
+    );
+    if (queuePassed) return;
+
+    const known = rows
+      .filter((r) => r.wait !== null)
+      .sort((a, b) => a.wait - b.wait);
+    const unknown = rows.filter((r) => r.wait === null);
+    if (known.length === 0) continue; // nobody in the queue yet (or anymore)
+    console.log("\nEstimated wait per window:");
+    known.forEach(({ win, wait }, i) =>
+      console.log(`  ${String(i + 1).padStart(2)}. ${win.label.padEnd(20)} ${wait} min`),
+    );
+    for (const { win } of unknown)
+      console.log(`   -. ${win.label.padEnd(20)} unknown`);
+
+    // Only windows with a known wait are closed, and the shortest one is always kept.
+    const toClose = known.filter(
+      ({ wait }, i) => i > 0 && (i >= keepBest || wait > maxWait),
+    );
+    for (const { win, wait } of toClose) {
+      console.log(`[${win.label}] closing, wait ${wait} min`);
+      await closeWindow(win);
+    }
   }
 }
 
@@ -471,3 +616,4 @@ if (launched.length === 0 && privateProcs.length === 0) {
 }
 console.log("All windows opened. Press Ctrl+C to close them.");
 if (!values["keep-all"]) watchQueue();
+rankQueue();
