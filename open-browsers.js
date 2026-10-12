@@ -13,7 +13,7 @@
 //   --keep-all        don't close the other windows when one gets through the queue
 //   --keep-best N     every minute, close all queued windows but the N with the shortest wait
 //   --max-wait M      every minute, close queued windows whose wait is over M minutes
-//   --dump-queue      save each window's queue page text to queue-dumps/ (to tune the parser)
+//   --dump-queue      save what's read from each queue page to queue-dumps/ (to tune parsing)
 //
 // Example:
 //   node open-browsers.js --chrome 3 --opera 0 --private 2
@@ -28,8 +28,9 @@
 // window is closed so only one session keeps polling the site's API (which blocks IPs that
 // poll too much). Firefox private windows can't be watched, but they do get closed.
 //
-// Queue ranking: every minute, the estimated wait shown on each window's Queue-it page is read
-// and printed as a table, shortest first. It only reads pages already loaded, so it adds no
+// Queue ranking: every minute, each window's Queue-it page is read (estimated wait, position,
+// queue ID, CAPTCHA/block) and printed as a table, shortest wait first. Windows sharing a
+// queue ID and blocked windows are reported. It only reads pages already loaded, so it adds no
 // requests. --keep-best / --max-wait use it to close the windows with the longest waits.
 //
 // Windows stay open until you press Ctrl+C.
@@ -121,7 +122,7 @@ const SITE_HOST = "bocasocios.bocajuniors.com.ar";
 // Throwaway profiles, deleted on exit.
 const PROFILES_DIR = join(import.meta.dirname, ".profiles");
 
-// Where --dump-queue saves the queue page texts. Git-ignored, kept after exit.
+// Where --dump-queue saves what's read from the queue pages. Git-ignored, kept after exit.
 const DUMPS_DIR = join(import.meta.dirname, "queue-dumps");
 
 // How often the queue ranking reads the windows. Queue-it updates its estimate every minute.
@@ -246,7 +247,7 @@ function writeFirefoxProfile(profile, { width, height }) {
 const launched = []; // Playwright browsers / persistent contexts (anything with close())
 const privateProcs = []; // spawned private-window processes
 // Every open window, for the queue watch and ranking:
-//   { label, pages() -> [[key, url]], queueText() -> string | null, close() }
+//   { label, pages() -> [[key, url]], queuePage() -> collectQueuePage() result | null, close() }
 const windows = [];
 let queuePassed = false; // set once a window gets through the queue
 
@@ -254,11 +255,9 @@ function trackPlaywrightWindow(label, context) {
   windows.push({
     label,
     pages: async () => context.pages().map((p) => [p, p.url()]),
-    queueText: async () => {
+    queuePage: async () => {
       const page = context.pages().find((p) => hostOf(p.url()) === QUEUE_HOST);
-      return page
-        ? page.innerText("body", { timeout: 5000 }).catch(() => null)
-        : null;
+      return page ? page.evaluate(collectQueuePage).catch(() => null) : null;
     },
     close: () => context.close(),
   });
@@ -370,7 +369,7 @@ function openPrivateWindows(name, count) {
         label,
         pages: async () =>
           (await devToolsTargets(profile)).map((t) => [t.id, t.url]),
-        queueText: () => devToolsQueueText(profile),
+        queuePage: () => devToolsQueuePage(profile),
         close: () => killProfile(profile),
       });
     } else {
@@ -378,7 +377,7 @@ function openPrivateWindows(name, count) {
       windows.push({
         label,
         pages: async () => [],
-        queueText: async () => null,
+        queuePage: async () => null,
         close: () => killProfile(profile),
       });
     }
@@ -405,8 +404,9 @@ async function devToolsTargets(profile) {
   }
 }
 
-// Text of a private Chromium window's Queue-it tab, read through the DevTools protocol.
-async function devToolsQueueText(profile) {
+// collectQueuePage() run in a private Chromium window's Queue-it tab, through the DevTools
+// protocol.
+async function devToolsQueuePage(profile) {
   const target = (await devToolsTargets(profile)).find(
     (t) => hostOf(t.url) === QUEUE_HOST,
   );
@@ -425,7 +425,10 @@ async function devToolsQueueText(profile) {
         JSON.stringify({
           id: 1,
           method: "Runtime.evaluate",
-          params: { expression: "document.body.innerText", returnByValue: true },
+          params: {
+            expression: `(${collectQueuePage})()`,
+            returnByValue: true,
+          },
         }),
       );
     ws.onmessage = ({ data }) => {
@@ -477,23 +480,99 @@ async function watchQueue() {
   }
 }
 
-// Turns Queue-it's estimated wait into minutes, or null if the text has none. Expects wording
-// like "Entrarás a la página web dentro de: 34 minutos" (or "1 hora y 5 minutos", "menos de un
-// minuto"). Not yet checked against a live queue: run with --dump-queue to collect real texts.
-function parseWaitMinutes(text) {
-  const plain = text
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "") // strip accents
-    .toLowerCase();
-  const estimate = /dentro de:?\s*([\s\S]{0,60})/.exec(plain)?.[1];
-  if (!estimate) return null;
-  if (/menos de (un|1) minuto/.test(estimate)) return 0;
+// Runs inside a Queue-it page (it's serialized, so it must be self-contained). The element IDs
+// are those of Queue-it's standard layout, as used by github.com/Pablosnt07/boca-fila-monitor;
+// they're not yet checked against Boca's queue, so the page text is kept as a fallback.
+function collectQueuePage() {
+  const visible = (el) =>
+    !!el &&
+    el.getClientRects().length > 0 &&
+    getComputedStyle(el).visibility !== "hidden";
+  const text = (selector) => {
+    const el = document.querySelector(selector);
+    return visible(el) ? el.innerText.trim() : "";
+  };
+  return {
+    url: location.href,
+    text: document.body?.innerText ?? "",
+    wait: text("#MainPart_lbExpectedServiceTimeRelative"),
+    position: text("#MainPart_lbQueueNumber"),
+    queueId:
+      text("#MainPart_lbQueueId") ||
+      text("#queueId") ||
+      document.querySelector("[data-queue-id]")?.getAttribute("data-queue-id") ||
+      "",
+    captcha: [...document.querySelectorAll("iframe")].some(
+      (f) => visible(f) && /captcha|challenge/i.test(f.src),
+    ),
+  };
+}
 
+// Lowercase without accents, so the patterns below don't depend on how the page spells them.
+function plain(text) {
+  return text
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase();
+}
+
+// "34 minutos", "1 hora y 5 minutos", "menos de un minuto"... to minutes, or null.
+function parseDuration(text) {
+  const t = plain(text);
+  if (/menos de (un|1) minuto/.test(t)) return 0;
   const count = (word) => (/^\d+$/.test(word) ? Number(word) : 1); // "un"/"una" = 1
-  const hours = /\b(\d+|una?)\s*horas?\b/.exec(estimate);
-  const minutes = /\b(\d+|un)\s*minutos?\b/.exec(estimate);
+  const hours = /\b(\d+|una?)\s*horas?\b/.exec(t);
+  const minutes = /\b(\d+|un)\s*minutos?\b/.exec(t);
   if (!hours && !minutes) return null;
   return (hours ? count(hours[1]) * 60 : 0) + (minutes ? count(minutes[1]) : 0);
+}
+
+// The estimated wait in the page text, e.g. "Entrarás a la página web dentro de: 34 minutos".
+// Not yet checked against a live queue: run with --dump-queue to collect real texts.
+function parseWaitMinutes(text) {
+  const estimate = /dentro de:?\s*([\s\S]{0,60})/.exec(plain(text))?.[1];
+  return estimate ? parseDuration(estimate) : null;
+}
+
+const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/;
+
+// Turns collectQueuePage()'s result into { wait, position, queueId, blocked }; each field is
+// null when the page doesn't show it.
+function interpretQueuePage(page) {
+  const text = plain(page.text);
+
+  const wait = parseDuration(page.wait) ?? parseWaitMinutes(page.text);
+
+  const positionText =
+    page.position ||
+    /(?:numero en la fila|posicion en la fila|tu posicion|tu numero)[^\d\n]{0,20}(\d[\d.,]*)/.exec(
+      text,
+    )?.[1] ||
+    "";
+  const position = /^\d[\d.,\s]*$/.test(positionText.trim())
+    ? Number(positionText.replace(/\D/g, ""))
+    : null;
+
+  let urlQueueId = null;
+  try {
+    urlQueueId = new URL(page.url).searchParams.get("q");
+  } catch {}
+  const queueId =
+    [
+      page.queueId,
+      urlQueueId,
+      /(?:id|identificador)[^\n]{0,40}?([0-9a-f-]{36})/.exec(text)?.[1],
+    ]
+      .map((candidate) => UUID.exec(plain(candidate ?? ""))?.[0])
+      .find(Boolean) ?? null;
+
+  const blocked =
+    page.captcha ||
+    /captcha|verifica que eres humano|verify you are human|acceso bloqueado|access denied|too many requests|demasiadas solicitudes/.test(
+      text,
+    );
+
+  return { wait, position, queueId, blocked };
 }
 
 // Value of a numeric flag, Infinity when it's not given. Exits on anything but a number >= 1.
@@ -507,10 +586,11 @@ function positiveFlag(name) {
   return n;
 }
 
-// Every RANK_INTERVAL_MS, reads the estimated wait of each window still in the queue, prints
-// them shortest first, and applies --keep-best / --max-wait.
+// Every RANK_INTERVAL_MS, reads each window still in the queue, prints them shortest wait first
+// (position breaks ties), reports blocked windows and shared queue IDs, and applies
+// --keep-best / --max-wait.
 async function rankQueue() {
-  const warned = new Set(); // windows whose text couldn't be parsed, warned once
+  const warned = new Set(); // windows already warned about (unparsed or blocked), once each
 
   while (!queuePassed) {
     await new Promise((r) => setTimeout(r, RANK_INTERVAL_MS));
@@ -518,40 +598,76 @@ async function rankQueue() {
 
     const rows = await Promise.all(
       windows.map(async (win) => {
-        const text = await win.queueText().catch(() => null);
-        if (text && values["dump-queue"]) {
+        const page = await win.queuePage().catch(() => null);
+        if (page && values["dump-queue"]) {
           mkdirSync(DUMPS_DIR, { recursive: true });
-          writeFileSync(join(DUMPS_DIR, `${win.label}.txt`), text);
+          writeFileSync(
+            join(DUMPS_DIR, `${win.label}.json`),
+            JSON.stringify(page, null, 2),
+          );
         }
-        const wait = text === null ? null : parseWaitMinutes(text);
-        if (text !== null && wait === null && !warned.has(win)) {
-          warned.add(win);
-          const snippet = text.replace(/\s+/g, " ").slice(0, 200);
-          console.warn(`[${win.label}] couldn't find the wait time in: "${snippet}"`);
-        }
-        return { win, wait };
+        return { win, info: page && interpretQueuePage(page), page };
       }),
     );
     if (queuePassed) return;
 
-    const known = rows
-      .filter((r) => r.wait !== null)
-      .sort((a, b) => a.wait - b.wait);
-    const unknown = rows.filter((r) => r.wait === null);
-    if (known.length === 0) continue; // nobody in the queue yet (or anymore)
-    console.log("\nEstimated wait per window:");
-    known.forEach(({ win, wait }, i) =>
-      console.log(`  ${String(i + 1).padStart(2)}. ${win.label.padEnd(20)} ${wait} min`),
-    );
-    for (const { win } of unknown)
-      console.log(`   -. ${win.label.padEnd(20)} unknown`);
+    for (const { win, info, page } of rows) {
+      if (!info || warned.has(win)) continue;
+      if (info.blocked) {
+        warned.add(win);
+        console.warn(
+          `[${win.label}] shows a CAPTCHA or block page: open it and check it by hand. ` +
+            "If several windows show this, close some to lower the load.",
+        );
+      } else if (info.wait === null) {
+        warned.add(win);
+        const snippet = page.text.replace(/\s+/g, " ").slice(0, 200);
+        console.warn(`[${win.label}] couldn't find the wait time in: "${snippet}"`);
+      }
+    }
 
-    // Only windows with a known wait are closed, and the shortest one is always kept.
-    const toClose = known.filter(
-      ({ wait }, i) => i > 0 && (i >= keepBest || wait > maxWait),
+    const inQueue = rows.filter((r) => r.info);
+    const known = inQueue
+      .filter((r) => r.info.wait !== null && !r.info.blocked)
+      .sort(
+        (a, b) =>
+          a.info.wait - b.info.wait ||
+          (a.info.position ?? Infinity) - (b.info.position ?? Infinity),
+      );
+    if (known.length === 0) continue; // nobody in the queue yet (or anymore)
+
+    const position = (info) =>
+      info.position === null ? "" : `  position ${info.position.toLocaleString("es-AR")}`;
+    console.log("\nQueue status per window:");
+    known.forEach(({ win, info }, i) =>
+      console.log(
+        `  ${String(i + 1).padStart(2)}. ${win.label.padEnd(20)} ${info.wait} min${position(info)}`,
+      ),
     );
-    for (const { win, wait } of toClose) {
-      console.log(`[${win.label}] closing, wait ${wait} min`);
+    for (const { win, info } of rows.filter((r) => !known.includes(r)))
+      console.log(
+        `   ${info?.blocked ? "!" : "-"}. ${win.label.padEnd(20)} ${info?.blocked ? "CAPTCHA/blocked" : "unknown"}`,
+      );
+
+    // Windows with the same queue ID hold the same place in line, so only one of them counts.
+    const byId = Map.groupBy(
+      inQueue.filter((r) => r.info.queueId),
+      (r) => r.info.queueId,
+    );
+    for (const [id, same] of byId)
+      if (same.length > 1)
+        console.warn(
+          `Same queue ID ${id} in: ${same.map((r) => r.win.label).join(", ")}. ` +
+            "They're one place in line, not several.",
+        );
+
+    // Only windows with a known wait are closed (never blocked or unknown ones), and the
+    // shortest one is always kept.
+    const toClose = known.filter(
+      ({ info }, i) => i > 0 && (i >= keepBest || info.wait > maxWait),
+    );
+    for (const { win, info } of toClose) {
+      console.log(`[${win.label}] closing, wait ${info.wait} min`);
       await closeWindow(win);
     }
   }
