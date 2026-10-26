@@ -4,21 +4,25 @@
 // Usage:
 //   node open-browsers.js [--chrome N] [--edge N] [--brave N] [--opera N] [--firefox N]
 //                         [--private N] [--url URL] [--screen WxH+X+Y] [--keep-all]
-//                         [--keep-best N] [--max-wait M] [--dump-queue]
+//                         [--keep-best N] [--max-wait M] [--no-dump-queue] [--no-hidden]
 //
-//   --<browser> N     normal windows for that browser (default 1, 0 to skip the browser)
+//   --<browser> N     normal windows for that browser (default 4, 0 to skip the browser)
 //   --private N       incognito/private windows per browser (default 1, 0 to disable)
 //   --screen WxH+X+Y  area to tile the windows over (default: the primary monitor's usable
 //                     area, detected with xrandr / _NET_WORKAREA)
 //   --keep-all        don't close the other windows when one gets through the queue
 //   --keep-best N     every minute, close all queued windows but the N with the shortest wait
 //   --max-wait M      every minute, close queued windows whose wait is over M minutes
-//   --dump-queue      save what's read from each queue page to queue-dumps/ (to tune parsing)
+//   --no-dump-queue   don't save what's read from each queue page to queue-dumps/ (saved by
+//                     default, to tune parsing)
+//   --no-hidden       show and tile the windows. By default the Chromium windows are minimized
+//                     (the one that gets through the queue is restored); Firefox ones can't be
+//                     minimized on Wayland, so they always show.
 //
 // Example:
-//   node open-browsers.js --chrome 3 --opera 0 --private 2
+//   node open-browsers.js --chrome 3 --opera 0 --private 2 --no-hidden
 //
-// Window layout: the Chromium-based browsers are tiled in a grid over the screen (one column
+// Window layout (with --no-hidden): the Chromium-based browsers are tiled in a grid over the screen (one column
 // per browser when possible, normal on top, private below). Their UI is scaled down when a grid
 // cell is narrower than their minimum window width. Firefox windows get the same cell size, but
 // GNOME decides where they go: Firefox crashes under XWayland here, and native Wayland windows
@@ -39,7 +43,7 @@ import { chromium, firefox } from "playwright";
 import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { parseArgs } from "node:util";
+import { parseArgs, styleText } from "node:util";
 
 // Each entry describes:
 //   engine/launchOptions: how Playwright launches the normal (automated) windows
@@ -127,13 +131,25 @@ const DUMPS_DIR = join(import.meta.dirname, "queue-dumps");
 
 // How often the queue ranking reads the windows. Queue-it updates its estimate every minute.
 const RANK_INTERVAL_MS = 60_000;
+// Used instead while some window is a minute or less from getting in.
+const RANK_INTERVAL_SOON_MS = 10_000;
+
+// Columns of the ranking table printed by printRanking().
+const COLUMNS = [
+  { title: "#", width: 2 },
+  { title: "Window", width: 18 },
+  { title: "Wait", width: 10 },
+  { title: "Position", width: 9 },
+  { title: "Progress", width: 10 },
+  { title: "Queue ID", width: 36 },
+];
 
 const { values } = parseArgs({
   options: {
     ...Object.fromEntries(
       Object.keys(BROWSERS).map((name) => [
         name,
-        { type: "string", default: "1" },
+        { type: "string", default: "4" },
       ]),
     ),
     private: { type: "string", default: "1" },
@@ -145,8 +161,10 @@ const { values } = parseArgs({
     "keep-all": { type: "boolean", default: false },
     "keep-best": { type: "string" },
     "max-wait": { type: "string" },
-    "dump-queue": { type: "boolean", default: false },
+    "dump-queue": { type: "boolean", default: true },
+    hidden: { type: "boolean", default: true },
   },
+  allowNegative: true, // --no-hidden, --no-dump-queue
 });
 const keepBest = positiveFlag("keep-best");
 const maxWait = positiveFlag("max-wait");
@@ -193,8 +211,7 @@ function detectScreen() {
 
 // Assigns each window label a cell (in screen pixels) of a grid covering the screen. Cells are
 // filled column by column, so each browser's normal + private windows end up stacked together.
-function computeGrid(labels) {
-  const screen = detectScreen();
+function computeGrid(labels, screen) {
   const n = Math.max(labels.length, 1);
   const cols = Math.ceil(Math.sqrt((n * screen.width) / screen.height));
   const rows = Math.ceil(n / cols);
@@ -251,9 +268,10 @@ const privateProcs = []; // spawned private-window processes
 const windows = [];
 let queuePassed = false; // set once a window gets through the queue
 
-function trackPlaywrightWindow(label, context) {
+function trackPlaywrightWindow(label, context, show = async () => {}) {
   windows.push({
     label,
+    show,
     pages: async () => context.pages().map((p) => [p, p.url()]),
     queuePage: async () => {
       const page = context.pages().find((p) => hostOf(p.url()) === QUEUE_HOST);
@@ -283,9 +301,7 @@ async function openNormalWindows(name, count) {
       ...BROWSERS[name].launchOptions,
     });
   } catch (err) {
-    console.warn(
-      `[${name}] could not launch, skipping: ${err.message.split("\n")[0]}`,
-    );
+    warn(`[${name}] could not launch, skipping: ${err.message.split("\n")[0]}`);
     return;
   }
   launched.push(browser);
@@ -295,19 +311,23 @@ async function openNormalWindows(name, count) {
       const label = `${name} #${i + 1}`;
       const context = await browser.newContext({ viewport: null });
       const page = await context.newPage();
-      trackPlaywrightWindow(label, context);
 
       // Move/resize this context's window through the DevTools protocol.
       const { x, y, width, height } = toUiUnits(grid.cells[label]);
       const cdp = await context.newCDPSession(page);
       const { windowId } = await cdp.send("Browser.getWindowForTarget");
+      const setState = (windowState) =>
+        cdp.send("Browser.setWindowBounds", { windowId, bounds: { windowState } });
       await cdp.send("Browser.setWindowBounds", {
         windowId,
         bounds: { left: x, top: y, width, height, windowState: "normal" },
       });
+      // Minimized windows keep running normally: Playwright disables background throttling.
+      if (values.hidden) await setState("minimized");
+      trackPlaywrightWindow(label, context, () => setState("normal"));
 
       await page.goto(values.url);
-      console.log(`[${label}] opened ${values.url}`);
+      logOpened(label);
     }),
   );
 }
@@ -319,7 +339,7 @@ async function openFirefoxNormalWindows(count) {
     Array.from({ length: count }, async (_, i) => {
       const label = `firefox #${i + 1}`;
       const profile = join(PROFILES_DIR, `firefox-normal-${i + 1}`);
-      writeFirefoxProfile(profile, grid);
+      writeFirefoxProfile(profile, firefoxCell);
 
       let context;
       try {
@@ -329,9 +349,7 @@ async function openFirefoxNormalWindows(count) {
           viewport: null,
         });
       } catch (err) {
-        console.warn(
-          `[${label}] could not launch, skipping: ${err.message.split("\n")[0]}`,
-        );
+        warn(`[${label}] could not launch, skipping: ${err.message.split("\n")[0]}`);
         return;
       }
       launched.push(context);
@@ -339,7 +357,7 @@ async function openFirefoxNormalWindows(count) {
 
       const page = context.pages()[0] ?? (await context.newPage());
       await page.goto(values.url);
-      console.log(`[${label}] opened ${values.url}`);
+      logOpened(label);
     }),
   );
 }
@@ -367,15 +385,17 @@ function openPrivateWindows(name, count) {
       );
       windows.push({
         label,
+        show: () => setPrivateWindowState(profile, "normal"),
         pages: async () =>
           (await devToolsTargets(profile)).map((t) => [t.id, t.url]),
         queuePage: () => devToolsQueuePage(profile),
         close: () => killProfile(profile),
       });
     } else {
-      writeFirefoxProfile(profile, grid);
+      writeFirefoxProfile(profile, firefoxCell);
       windows.push({
         label,
+        show: async () => {},
         pages: async () => [],
         queuePage: async () => null,
         close: () => killProfile(profile),
@@ -384,9 +404,13 @@ function openPrivateWindows(name, count) {
 
     const proc = spawn(command, args, { detached: true, stdio: "ignore" });
     proc.on("error", (err) =>
-      console.warn(`[${label}] could not launch: ${err.message}`),
+      warn(`[${label}] could not launch: ${err.message}`),
     );
-    proc.on("spawn", () => console.log(`[${label}] opened ${values.url}`));
+    proc.on("spawn", () => {
+      logOpened(label);
+      if (values.hidden && engine === chromium)
+        setPrivateWindowState(profile, "minimized");
+    });
     privateProcs.push(proc);
   }
 }
@@ -404,6 +428,26 @@ async function devToolsTargets(profile) {
   }
 }
 
+// Sends one DevTools protocol command over a WebSocket and resolves with its result (null on
+// error or after 5 s).
+function cdpSend(wsUrl, method, params = {}) {
+  return new Promise((resolve) => {
+    const ws = new WebSocket(wsUrl);
+    const done = (value) => {
+      clearTimeout(timer);
+      ws.close();
+      resolve(value);
+    };
+    const timer = setTimeout(() => done(null), 5000);
+    ws.onopen = () => ws.send(JSON.stringify({ id: 1, method, params }));
+    ws.onmessage = ({ data }) => {
+      const msg = JSON.parse(data);
+      if (msg.id === 1) done(msg.result ?? null);
+    };
+    ws.onerror = () => done(null);
+  });
+}
+
 // collectQueuePage() run in a private Chromium window's Queue-it tab, through the DevTools
 // protocol.
 async function devToolsQueuePage(profile) {
@@ -411,32 +455,39 @@ async function devToolsQueuePage(profile) {
     (t) => hostOf(t.url) === QUEUE_HOST,
   );
   if (!target) return null;
-
-  return new Promise((resolve) => {
-    const ws = new WebSocket(target.webSocketDebuggerUrl);
-    const done = (value) => {
-      clearTimeout(timer);
-      ws.close();
-      resolve(value);
-    };
-    const timer = setTimeout(() => done(null), 5000);
-    ws.onopen = () =>
-      ws.send(
-        JSON.stringify({
-          id: 1,
-          method: "Runtime.evaluate",
-          params: {
-            expression: `(${collectQueuePage})()`,
-            returnByValue: true,
-          },
-        }),
-      );
-    ws.onmessage = ({ data }) => {
-      const msg = JSON.parse(data);
-      if (msg.id === 1) done(msg.result?.result?.value ?? null);
-    };
-    ws.onerror = () => done(null);
+  const res = await cdpSend(target.webSocketDebuggerUrl, "Runtime.evaluate", {
+    expression: `(${collectQueuePage})()`,
+    returnByValue: true,
   });
+  return res?.result?.value ?? null;
+}
+
+// Minimizes or restores a private Chromium window through its browser-level DevTools endpoint.
+// Retries for a while, since the window may still be starting.
+async function setPrivateWindowState(profile, windowState) {
+  for (let tries = 0; tries < 30; tries++) {
+    try {
+      const [port, path] = readFileSync(
+        join(profile, "DevToolsActivePort"),
+        "utf8",
+      ).split("\n");
+      const [target] = await devToolsTargets(profile);
+      const browserWs = `ws://127.0.0.1:${port}${path}`;
+      const win =
+        target &&
+        (await cdpSend(browserWs, "Browser.getWindowForTarget", {
+          targetId: target.id,
+        }));
+      if (win) {
+        await cdpSend(browserWs, "Browser.setWindowBounds", {
+          windowId: win.windowId,
+          bounds: { windowState },
+        });
+        return;
+      }
+    } catch {} // not started yet
+    await new Promise((r) => setTimeout(r, 1000));
+  }
 }
 
 // Kills the processes using this profile. The trailing "( |$)" keeps "chrome-private-1" from
@@ -465,13 +516,19 @@ async function watchQueue() {
         if (host === QUEUE_HOST) {
           queued.add(key);
         } else if (host === SITE_HOST && queued.has(key)) {
+          // \x07 rings the terminal bell.
           console.log(
-            `[${win.label}] got through the queue, closing the other windows...`,
+            "\x07\n" +
+              styleText(
+                ["bold", "green"],
+                `[${win.label}] got through the queue! Closing the other windows...`,
+              ),
           );
           queuePassed = true;
+          await win.show().catch(() => {});
           const others = windows.filter((w) => w !== win);
           await Promise.allSettled(others.map(closeWindow));
-          console.log(`Only [${win.label}] is left open.`);
+          console.log(styleText(["bold", "green"], `Only [${win.label}] is left open.`));
           return;
         }
       }
@@ -492,13 +549,40 @@ function collectQueuePage() {
     const el = document.querySelector(selector);
     return visible(el) ? el.innerText.trim() : "";
   };
+  // Queue-it's knockout view model holds the ticket values even when the layout hides them
+  // (Boca's hides the wait and the position).
+  const vm = window.queueViewModel;
+  const unwrap = (v) => {
+    try {
+      return typeof v === "function" ? v() : (v ?? null);
+    } catch {
+      return null;
+    }
+  };
+  const ticket = Object.fromEntries(
+    [
+      "whichIsIn",
+      "queueNumber",
+      "usersInLineAheadOfYou",
+      "expectedServiceTime",
+      "expectedServiceTimeUTC",
+      "progress",
+      "usersInQueue",
+    ].map((key) => [key, unwrap(vm?.ticket?.[key])]),
+  );
   return {
     url: location.href,
     text: document.body?.innerText ?? "",
-    wait: text("#MainPart_lbExpectedServiceTimeRelative"),
-    position: text("#MainPart_lbQueueNumber"),
+    prequeue: !!document.body?.classList.contains("before"),
+    ticket,
+    wait:
+      text("#MainPart_lbExpectedServiceTimeRelative") || text("#MainPart_lbWhichIsIn"),
+    position:
+      text("#MainPart_lbQueueNumber") || text("#MainPart_lbUsersInLineAheadOfYou"),
     queueId:
       text("#MainPart_lbQueueId") ||
+      text("#hlLinkToQueueTicket2") ||
+      String(unwrap(vm?.queueId) ?? "") ||
       text("#queueId") ||
       document.querySelector("[data-queue-id]")?.getAttribute("data-queue-id") ||
       "",
@@ -541,10 +625,22 @@ const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/;
 function interpretQueuePage(page) {
   const text = plain(page.text);
 
-  const wait = parseDuration(page.wait) ?? parseWaitMinutes(page.text);
+  const ticket = page.ticket ?? {};
+  const serviceAt = Date.parse(ticket.expectedServiceTimeUTC ?? "");
+  const waitText = [page.wait, String(ticket.whichIsIn ?? "")].find(
+    (t) => parseDuration(t) !== null,
+  );
+  const wait =
+    (waitText && parseDuration(waitText)) ??
+    (serviceAt ? Math.max(0, Math.round((serviceAt - Date.now()) / 60000)) : null) ??
+    parseWaitMinutes(page.text);
+  // "más de una hora": the wait is at least `wait`, not exactly.
+  const waitOver = !!waitText && /\bmas de\b/.test(plain(waitText));
+  const progress = typeof ticket.progress === "number" ? ticket.progress : null;
 
   const positionText =
     page.position ||
+    String(ticket.queueNumber ?? ticket.usersInLineAheadOfYou ?? "") ||
     /(?:numero en la fila|posicion en la fila|tu posicion|tu numero)[^\d\n]{0,20}(\d[\d.,]*)/.exec(
       text,
     )?.[1] ||
@@ -572,7 +668,15 @@ function interpretQueuePage(page) {
       text,
     );
 
-  return { wait, position, queueId, blocked };
+  return {
+    wait,
+    waitOver,
+    position,
+    progress,
+    queueId,
+    blocked,
+    prequeue: !!page.prequeue,
+  };
 }
 
 // Value of a numeric flag, Infinity when it's not given. Exits on anything but a number >= 1.
@@ -592,8 +696,9 @@ function positiveFlag(name) {
 async function rankQueue() {
   const warned = new Set(); // windows already warned about (unparsed or blocked), once each
 
+  let interval = RANK_INTERVAL_MS;
   while (!queuePassed) {
-    await new Promise((r) => setTimeout(r, RANK_INTERVAL_MS));
+    await new Promise((r) => setTimeout(r, interval));
     if (queuePassed) return;
 
     const rows = await Promise.all(
@@ -615,14 +720,14 @@ async function rankQueue() {
       if (!info || warned.has(win)) continue;
       if (info.blocked) {
         warned.add(win);
-        console.warn(
+        warn(
           `[${win.label}] shows a CAPTCHA or block page: open it and check it by hand. ` +
             "If several windows show this, close some to lower the load.",
         );
-      } else if (info.wait === null) {
+      } else if (info.wait === null && !info.prequeue) {
         warned.add(win);
         const snippet = page.text.replace(/\s+/g, " ").slice(0, 200);
-        console.warn(`[${win.label}] couldn't find the wait time in: "${snippet}"`);
+        warn(`[${win.label}] couldn't find the wait time in: "${snippet}"`);
       }
     }
 
@@ -632,22 +737,14 @@ async function rankQueue() {
       .sort(
         (a, b) =>
           a.info.wait - b.info.wait ||
+          a.info.waitOver - b.info.waitOver ||
+          (b.info.progress ?? -1) - (a.info.progress ?? -1) ||
           (a.info.position ?? Infinity) - (b.info.position ?? Infinity),
       );
-    if (known.length === 0) continue; // nobody in the queue yet (or anymore)
+    interval = known[0]?.info.wait <= 1 ? RANK_INTERVAL_SOON_MS : RANK_INTERVAL_MS;
+    if (inQueue.length === 0) continue; // nobody in the queue yet (or anymore)
 
-    const position = (info) =>
-      info.position === null ? "" : `  position ${info.position.toLocaleString("es-AR")}`;
-    console.log("\nQueue status per window:");
-    known.forEach(({ win, info }, i) =>
-      console.log(
-        `  ${String(i + 1).padStart(2)}. ${win.label.padEnd(20)} ${info.wait} min${position(info)}`,
-      ),
-    );
-    for (const { win, info } of rows.filter((r) => !known.includes(r)))
-      console.log(
-        `   ${info?.blocked ? "!" : "-"}. ${win.label.padEnd(20)} ${info?.blocked ? "CAPTCHA/blocked" : "unknown"}`,
-      );
+    printRanking(known, rows.filter((r) => !known.includes(r)));
 
     // Windows with the same queue ID hold the same place in line, so only one of them counts.
     const byId = Map.groupBy(
@@ -656,7 +753,7 @@ async function rankQueue() {
     );
     for (const [id, same] of byId)
       if (same.length > 1)
-        console.warn(
+        warn(
           `Same queue ID ${id} in: ${same.map((r) => r.win.label).join(", ")}. ` +
             "They're one place in line, not several.",
         );
@@ -667,14 +764,101 @@ async function rankQueue() {
       ({ info }, i) => i > 0 && (i >= keepBest || info.wait > maxWait),
     );
     for (const { win, info } of toClose) {
-      console.log(`[${win.label}] closing, wait ${info.wait} min`);
+      console.log(
+        styleText("dim", `[${win.label}] closing, wait ${formatWait(info)[0]}`),
+      );
       await closeWindow(win);
     }
   }
 }
 
+function warn(message) {
+  console.warn(styleText("yellow", `⚠ ${message}`));
+}
+
+function logOpened(label) {
+  console.log(styleText("dim", `[${label}] opened ${values.url}`));
+}
+
+// The wait column's text and style for a window.
+function formatWait(info) {
+  if (!info) return ["no data", "dim"]; // not on the queue page, or unreadable (Firefox private)
+  if (info.blocked) return ["CAPTCHA", ["bold", "red"]];
+  if (info.wait === null)
+    return info.prequeue ? ["prequeue", "dim"] : ["unknown", "yellow"];
+  const { wait, waitOver } = info;
+  const minutes = wait % 60;
+  const text =
+    wait === 0
+      ? "< 1 min"
+      : wait < 60
+        ? `${wait} min`
+        : `${Math.floor(wait / 60)} h` + (minutes ? ` ${minutes} min` : "");
+  return [
+    waitOver ? `> ${text}` : text,
+    wait <= 1 ? ["bold", "green"] : null,
+  ];
+}
+
+// A text progress bar, e.g. "▰▰▰▱▱  45%".
+function formatProgress(progress) {
+  if (progress === null) return "";
+  const pct = Math.round(progress * 100);
+  const filled = Math.round(pct / 20);
+  return "▰".repeat(filled) + "▱".repeat(5 - filled) + `${pct}%`.padStart(5);
+}
+
+function tableLine(left, mid, right) {
+  return styleText(
+    "dim",
+    left + COLUMNS.map((c) => "─".repeat(c.width + 2)).join(mid) + right,
+  );
+}
+
+// cells: one [text, style] per column; style is a styleText() format, or null for none.
+function tableRow(cells) {
+  const bar = styleText("dim", "│");
+  const fitted = cells.map(([text, style], i) => {
+    const { width } = COLUMNS[i];
+    const padded =
+      text.length > width ? text.slice(0, width - 1) + "…" : text.padEnd(width);
+    return ` ${style ? styleText(style, padded) : padded} `;
+  });
+  return bar + fitted.join(bar) + bar;
+}
+
+// Prints the ranking table: `ranked` rows (known wait, shortest first) are numbered and the best
+// one is highlighted; `others` (prequeue, blocked, unknown, unreadable) follow.
+function printRanking(ranked, others) {
+  const time = new Date().toLocaleTimeString("es-AR");
+  console.log(
+    "\n" +
+      styleText("bold", "Queue status") +
+      styleText("dim", ` · ${time} · ${ranked.length} of ${ranked.length + others.length} windows ranked`),
+  );
+  console.log(tableLine("┌", "┬", "┐"));
+  console.log(tableRow(COLUMNS.map((c) => [c.title, "bold"])));
+  console.log(tableLine("├", "┼", "┤"));
+  for (const [i, { win, info }] of [...ranked, ...others].entries()) {
+    const isRanked = i < ranked.length;
+    const best = i === 0 && isRanked;
+    const rank = isRanked ? String(i + 1).padStart(2) : info?.blocked ? " !" : " ·";
+    console.log(
+      tableRow([
+        [rank, best ? ["bold", "green"] : isRanked ? null : "dim"],
+        [win.label, best ? ["bold", "green"] : isRanked ? null : "dim"],
+        formatWait(info),
+        [info?.position?.toLocaleString("es-AR") ?? "", null],
+        [formatProgress(info?.progress ?? null), "cyan"],
+        [info?.queueId ?? "", "dim"],
+      ]),
+    );
+  }
+  console.log(tableLine("└", "┴", "┘"));
+}
+
 async function closeAll() {
-  console.log("\nClosing browsers...");
+  console.log(styleText("dim", "\nClosing browsers..."));
   // Some browsers (e.g. Opera) re-parent themselves away from the process we
   // spawned, so find the private-window processes by their profile path instead.
   if (privateProcs.length > 0) {
@@ -700,24 +884,51 @@ const enabled = Object.keys(BROWSERS).filter(
 
 // Grid cells for the Chromium windows, in display order: each browser's normal windows, then
 // its private ones. Firefox windows aren't in the grid since they can't be positioned.
-const grid = computeGrid(
-  enabled
-    .filter((name) => BROWSERS[name].engine === chromium)
-    .flatMap((name) => [
-      ...Array.from(
-        { length: Number(values[name]) },
-        (_, i) => `${name} #${i + 1}`,
-      ),
-      ...Array.from(
-        { length: privateCount },
-        (_, i) => `${name} private #${i + 1}`,
-      ),
-    ]),
-);
+const chromiumLabels = enabled
+  .filter((name) => BROWSERS[name].engine === chromium)
+  .flatMap((name) => [
+    ...Array.from(
+      { length: Number(values[name]) },
+      (_, i) => `${name} #${i + 1}`,
+    ),
+    ...Array.from(
+      { length: privateCount },
+      (_, i) => `${name} private #${i + 1}`,
+    ),
+  ]);
+const firefoxCount = enabled.includes("firefox")
+  ? Number(values.firefox) + privateCount
+  : 0;
+const screen = detectScreen();
+// Hidden: the minimized Chromium windows all get the whole screen, so the one that gets through
+// is restored full size and unscaled, and only the (visible) Firefox windows share the screen.
+const grid = values.hidden
+  ? {
+      cells: Object.fromEntries(chromiumLabels.map((l) => [l, screen])),
+      width: screen.width,
+      height: screen.height,
+    }
+  : computeGrid(chromiumLabels, screen);
+const firefoxCell = values.hidden
+  ? computeGrid(Array.from({ length: firefoxCount }, String), screen)
+  : grid;
 const chromiumScale = Math.min(
   1,
   Math.floor((grid.width / CHROMIUM_MIN_WIDTH) * 100) / 100,
 );
+
+console.log(
+  styleText("bold", `Opening ${chromiumLabels.length + firefoxCount} windows`) +
+    styleText(
+      "dim",
+      ` · ${values.hidden ? "hidden" : "tiled"}` +
+        (values["dump-queue"] ? " · saving queue pages to queue-dumps/" : ""),
+    ),
+);
+if (values.hidden && firefoxCount > 0)
+  console.log(
+    styleText("dim", "Firefox windows stay visible: they can't be minimized on Wayland."),
+  );
 
 await Promise.all(
   enabled.map(async (name) => {
@@ -727,9 +938,12 @@ await Promise.all(
 );
 
 if (launched.length === 0 && privateProcs.length === 0) {
-  console.error("No browser could be launched.");
+  console.error(styleText("red", "No browser could be launched."));
   process.exit(1);
 }
-console.log("All windows opened. Press Ctrl+C to close them.");
+console.log(
+  styleText("bold", "All windows opened.") +
+    styleText("dim", " The ranking is printed every minute. Press Ctrl+C to close them."),
+);
 if (!values["keep-all"]) watchQueue();
 rankQueue();

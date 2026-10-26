@@ -1,2 +1,3 @@
 node_modules/
-.profiles/queue-dumps/
+.profiles/
+queue-dumps/

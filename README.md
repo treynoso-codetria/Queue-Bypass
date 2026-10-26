@@ -16,22 +16,26 @@ Además se necesitan `xrandr` y `xprop` (para detectar la pantalla) y `pkill`. L
 ## Uso
 
 ```bash
-node open-browsers.js                       # 1 ventana normal + 1 privada por navegador
+node open-browsers.js                       # 4 normales + 1 privada por navegador, minimizadas
 node open-browsers.js --chrome 2 --opera 0  # 2 normales de Chrome, sin Opera
 node open-browsers.js --private 0           # sin ventanas privadas
+node open-browsers.js --no-hidden           # ventanas visibles, en grilla
 node open-browsers.js --keep-all            # no cerrar las demás al pasar la fila
 ```
 
+Por defecto abre 25 ventanas (4 normales + 1 privada en cada uno de los 5 navegadores), **minimizadas**: lo que importa se ve en la terminal. Cuando una pasa la fila, se restaura sola, suena la campana de la terminal y se cierran las demás. Firefox es la excepción: corre como ventana nativa de Wayland y GNOME no deja minimizarla desde afuera, así que sus 5 ventanas quedan visibles.
+
 | Flag | Significado |
 |---|---|
-| `--<navegador> N` | Ventanas normales de ese navegador (por defecto 1, `0` lo omite) |
+| `--<navegador> N` | Ventanas normales de ese navegador (por defecto 4, `0` lo omite) |
 | `--private N` | Ventanas privadas por navegador (por defecto 1) |
 | `--url URL` | URL inicial (por defecto `https://bocasocios.bocajuniors.com.ar/home`) |
 | `--screen WxH+X+Y` | Área de pantalla para la grilla (por defecto se detecta sola) |
+| `--no-hidden` | No minimiza las ventanas: las acomoda en grilla |
 | `--keep-all` | Desactiva el cierre automático de ventanas |
 | `--keep-best N` | Cada minuto, cierra las ventanas en fila salvo las N con menor espera |
 | `--max-wait M` | Cada minuto, cierra las ventanas en fila con más de M minutos de espera |
-| `--dump-queue` | Guarda el texto de la página de la fila de cada ventana en `queue-dumps/` |
+| `--no-dump-queue` | No guarda la página de la fila de cada ventana en `queue-dumps/` (por defecto se guarda) |
 
 `Ctrl+C` cierra todas las ventanas y borra los perfiles temporales de `.profiles/`.
 
@@ -101,24 +105,32 @@ Qué hacer:
 
 ## Ranking de la fila (experimental)
 
-Cada minuto, el script lee la página de Queue-it de cada ventana y muestra una tabla ordenada por espera, de menor a mayor (la posición en la fila desempata):
+Cada minuto (cada 10 segundos cuando alguna ventana está a un minuto o menos de entrar), el script lee la página de Queue-it de cada ventana y muestra una tabla ordenada por espera, de menor a mayor. Desempatan el progreso y después la posición:
 
 ```
-Queue status per window:
-   1. brave private #1     3 min  position 1.204
-   2. chrome #1            12 min  position 4.523
-   -. firefox private #1   unknown
-   !. edge private #1      CAPTCHA/blocked
+Queue status · 13:21:05 · 4 of 6 windows ranked
+┌────┬────────────────────┬────────────┬───────────┬────────────┬──────────────────────────────────────┐
+│ #  │ Window             │ Wait       │ Position  │ Progress   │ Queue ID                             │
+├────┼────────────────────┼────────────┼───────────┼────────────┼──────────────────────────────────────┤
+│  1 │ chrome #4          │ < 1 min    │           │ ▰▰▰▰▰  98% │ 038e9af4-c803-4a00-9445-2896f3fe2761 │
+│  2 │ edge #1            │ 34 min     │ 45.678    │ ▰▰▱▱▱  41% │ aaaaaaaa-2222-3333-4444-555555555555 │
+│  3 │ chrome #2          │ > 1 h      │           │ ▱▱▱▱▱   5% │ d93af6d7-25dc-4fd1-aa05-44df7580f129 │
+│  4 │ chrome #1          │ > 1 h      │           │ ▱▱▱▱▱   2% │ c8eb54ae-96d9-4af9-9b11-2aa4970944fa │
+│  ! │ brave private #1   │ CAPTCHA    │           │            │                                      │
+│  · │ firefox private #1 │ no data    │           │            │                                      │
+└────┴────────────────────┴────────────┴───────────┴────────────┴──────────────────────────────────────┘
 ```
+
+En la terminal la mejor ventana sale en verde, las que están a menos de un minuto también, y las bloqueadas en rojo. Antes de que abra la fila, las ventanas aparecen como `prequeue`. La tabla mide unos 105 caracteres de ancho: con la terminal más angosta se corta.
 
 - **No genera tráfico:** solo lee páginas que ya están cargadas, sin peticiones extra a Queue-it ni a Boca.
-- **Qué lee:** primero los elementos de la plantilla estándar de Queue-it (`#MainPart_lbExpectedServiceTimeRelative` para la espera, `#MainPart_lbQueueNumber` para la posición, `#MainPart_lbQueueId` para el ID). Si no están, busca en el texto ("dentro de: 34 minutos", "Tu número en la fila: 1.234"). Los IDs vienen de [boca-fila-monitor](https://github.com/Pablosnt07/boca-fila-monitor) y tampoco están verificados con la fila de Boca.
+- **Qué lee:** primero los elementos visibles de la página (en la de Boca, `#MainPart_lbWhichIsIn` para la espera, `#MainPart_lbQueueNumber` para la posición y `#hlLinkToQueueTicket2` para el ID). Después, el estado interno de Queue-it (`window.queueViewModel.ticket`), que tiene la espera, la posición y el progreso aunque la plantilla los oculte. Por último, el texto de la página ("dentro de: 34 minutos"). "Más de una hora" se muestra como `> 1 h`.
 - **CAPTCHA o bloqueo:** si una ventana muestra un iframe de captcha o textos como "too many requests" o "acceso bloqueado", aparece con `!` y la terminal avisa que la revises a mano. Si son varias, cerrá algunas para bajar la carga.
 - **IDs de fila repetidos:** si dos ventanas tienen el mismo ID de Queue-it, la terminal lo avisa. Ocupan **un solo lugar** en la fila, no varios.
 - **Con `--keep-best N` o `--max-wait M`** cierra las ventanas con más espera. Nunca cierra la de menor espera ni las marcadas como `unknown` o bloqueadas. Conviene `--keep-best 2` o más: la estimación de Queue-it varía y la fila no siempre avanza parejo.
-- **Nada de esto se probó todavía contra una fila real.** Si una ventana no muestra la espera en un formato conocido, aparece como `unknown` y la terminal imprime el texto que no pudo interpretar.
-- **En el próximo evento, corré con `--dump-queue`.** Así se guarda en `queue-dumps/<ventana>.json` (ignorado por git) lo que se leyó de cada fila (texto completo, valores de los elementos, URL) y se puede ajustar `interpretQueuePage` en `open-browsers.js`. Esos archivos incluyen el ID de tu lugar en la fila: no los compartas.
-- Firefox privado siempre aparece como `unknown`, por la misma razón que no puede ganar en el cierre automático.
+- **Probado con la fila de Boca del 26/10/2026,** solo con ventanas de Chrome. Si una ventana muestra la espera en un formato desconocido, aparece como `unknown` y la terminal imprime el texto que no pudo interpretar.
+- **Por defecto se guarda `queue-dumps/<ventana>.json`** (ignorado por git), con lo que se leyó de cada fila (texto completo, valores de los elementos, URL), para poder ajustar `interpretQueuePage` en `open-browsers.js`. Esos archivos incluyen el ID de tu lugar en la fila: no los compartas.
+- Firefox privado siempre aparece como `no data`, por la misma razón que no puede ganar en el cierre automático.
 
 ## Limitaciones del cierre automático
 
