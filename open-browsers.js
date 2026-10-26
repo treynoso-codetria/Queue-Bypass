@@ -43,7 +43,7 @@ import { chromium, firefox } from "playwright";
 import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { parseArgs, styleText } from "node:util";
+import { parseArgs, stripVTControlCharacters, styleText } from "node:util";
 
 // Each entry describes:
 //   engine/launchOptions: how Playwright launches the normal (automated) windows
@@ -133,6 +133,8 @@ const DUMPS_DIR = join(import.meta.dirname, "queue-dumps");
 const RANK_INTERVAL_MS = 60_000;
 // Used instead while some window is a minute or less from getting in.
 const RANK_INTERVAL_SOON_MS = 10_000;
+// Used instead until the first table is printed, so it shows up soon after the windows load.
+const RANK_INTERVAL_FIRST_MS = 10_000;
 
 // Columns of the ranking table printed by printRanking().
 const COLUMNS = [
@@ -142,6 +144,7 @@ const COLUMNS = [
   { title: "Position", width: 9 },
   { title: "Progress", width: 10 },
   { title: "Queue ID", width: 36 },
+  { title: "Link", width: 4 },
 ];
 
 const { values } = parseArgs({
@@ -517,7 +520,7 @@ async function watchQueue() {
           queued.add(key);
         } else if (host === SITE_HOST && queued.has(key)) {
           // \x07 rings the terminal bell.
-          console.log(
+          log(
             "\x07\n" +
               styleText(
                 ["bold", "green"],
@@ -525,10 +528,11 @@ async function watchQueue() {
               ),
           );
           queuePassed = true;
+          stopLive();
           await win.show().catch(() => {});
           const others = windows.filter((w) => w !== win);
           await Promise.allSettled(others.map(closeWindow));
-          console.log(styleText(["bold", "green"], `Only [${win.label}] is left open.`));
+          log(styleText(["bold", "green"], `Only [${win.label}] is left open.`));
           return;
         }
       }
@@ -575,6 +579,9 @@ function collectQueuePage() {
     text: document.body?.innerText ?? "",
     prequeue: !!document.body?.classList.contains("before"),
     ticket,
+    loaded: !!vm, // false while the page is still loading
+    // What Queue-it's "Copiar mi enlace" button copies.
+    link: String(unwrap(vm?.initialWindowLocation) ?? ""),
     wait:
       text("#MainPart_lbExpectedServiceTimeRelative") || text("#MainPart_lbWhichIsIn"),
     position:
@@ -668,12 +675,23 @@ function interpretQueuePage(page) {
       text,
     );
 
+  // Link to this place in line: opening it in another browser continues with the same queue ID.
+  // The page URL doesn't carry the ID, so it's set as the "q" parameter.
+  let link = null;
+  if (queueId)
+    try {
+      const url = new URL(page.link || page.url);
+      url.searchParams.set("q", queueId);
+      link = url.href;
+    } catch {}
+
   return {
     wait,
     waitOver,
     position,
     progress,
     queueId,
+    link,
     blocked,
     prequeue: !!page.prequeue,
   };
@@ -696,8 +714,10 @@ function positiveFlag(name) {
 async function rankQueue() {
   const warned = new Set(); // windows already warned about (unparsed or blocked), once each
 
-  let interval = RANK_INTERVAL_MS;
+  let interval = RANK_INTERVAL_FIRST_MS;
+  let printed = false; // whether a table has been printed yet
   while (!queuePassed) {
+    nextUpdateAt = Date.now() + interval;
     await new Promise((r) => setTimeout(r, interval));
     if (queuePassed) return;
 
@@ -724,7 +744,7 @@ async function rankQueue() {
           `[${win.label}] shows a CAPTCHA or block page: open it and check it by hand. ` +
             "If several windows show this, close some to lower the load.",
         );
-      } else if (info.wait === null && !info.prequeue) {
+      } else if (info.wait === null && !info.prequeue && page.loaded) {
         warned.add(win);
         const snippet = page.text.replace(/\s+/g, " ").slice(0, 200);
         warn(`[${win.label}] couldn't find the wait time in: "${snippet}"`);
@@ -741,10 +761,16 @@ async function rankQueue() {
           (b.info.progress ?? -1) - (a.info.progress ?? -1) ||
           (a.info.position ?? Infinity) - (b.info.position ?? Infinity),
       );
-    interval = known[0]?.info.wait <= 1 ? RANK_INTERVAL_SOON_MS : RANK_INTERVAL_MS;
+    interval =
+      inQueue.length === 0 && !printed
+        ? RANK_INTERVAL_FIRST_MS
+        : known[0]?.info.wait <= 1
+          ? RANK_INTERVAL_SOON_MS
+          : RANK_INTERVAL_MS;
     if (inQueue.length === 0) continue; // nobody in the queue yet (or anymore)
 
     printRanking(known, rows.filter((r) => !known.includes(r)));
+    printed = true;
 
     // Windows with the same queue ID hold the same place in line, so only one of them counts.
     const byId = Map.groupBy(
@@ -764,7 +790,7 @@ async function rankQueue() {
       ({ info }, i) => i > 0 && (i >= keepBest || info.wait > maxWait),
     );
     for (const { win, info } of toClose) {
-      console.log(
+      log(
         styleText("dim", `[${win.label}] closing, wait ${formatWait(info)[0]}`),
       );
       await closeWindow(win);
@@ -773,11 +799,11 @@ async function rankQueue() {
 }
 
 function warn(message) {
-  console.warn(styleText("yellow", `⚠ ${message}`));
+  print(() => console.warn(styleText("yellow", `⚠ ${message}`)));
 }
 
 function logOpened(label) {
-  console.log(styleText("dim", `[${label}] opened ${values.url}`));
+  log(styleText("dim", `[${label}] opened ${values.url}`));
 }
 
 // The wait column's text and style for a window.
@@ -815,14 +841,23 @@ function tableLine(left, mid, right) {
   );
 }
 
-// cells: one [text, style] per column; style is a styleText() format, or null for none.
+// A terminal hyperlink (OSC 8): shows `text`, and the terminal can open or copy `url` (in GNOME
+// Terminal: Ctrl+click, or right-click > Copy Link Address). Plain text when not on a terminal.
+function hyperlink(url, text) {
+  return url && process.stdout.isTTY
+    ? `\x1b]8;;${url}\x1b\\${text}\x1b]8;;\x1b\\`
+    : text;
+}
+
+// cells: one [text, style, url] per column; style is a styleText() format, or null for none, and
+// url (optional) makes the text a hyperlink.
 function tableRow(cells) {
   const bar = styleText("dim", "│");
-  const fitted = cells.map(([text, style], i) => {
+  const fitted = cells.map(([text, style, url], i) => {
     const { width } = COLUMNS[i];
-    const padded =
-      text.length > width ? text.slice(0, width - 1) + "…" : text.padEnd(width);
-    return ` ${style ? styleText(style, padded) : padded} `;
+    const fit = text.length > width ? text.slice(0, width - 1) + "…" : text;
+    const shown = hyperlink(url, style ? styleText(style, fit) : fit);
+    return ` ${shown}${" ".repeat(width - fit.length)} `;
   });
   return bar + fitted.join(bar) + bar;
 }
@@ -831,19 +866,19 @@ function tableRow(cells) {
 // one is highlighted; `others` (prequeue, blocked, unknown, unreadable) follow.
 function printRanking(ranked, others) {
   const time = new Date().toLocaleTimeString("es-AR");
-  console.log(
-    "\n" +
-      styleText("bold", "Queue status") +
+  const lines = [
+    "",
+    styleText("bold", "Queue status") +
       styleText("dim", ` · ${time} · ${ranked.length} of ${ranked.length + others.length} windows ranked`),
-  );
-  console.log(tableLine("┌", "┬", "┐"));
-  console.log(tableRow(COLUMNS.map((c) => [c.title, "bold"])));
-  console.log(tableLine("├", "┼", "┤"));
+    tableLine("┌", "┬", "┐"),
+    tableRow(COLUMNS.map((c) => [c.title, "bold"])),
+    tableLine("├", "┼", "┤"),
+  ];
   for (const [i, { win, info }] of [...ranked, ...others].entries()) {
     const isRanked = i < ranked.length;
     const best = i === 0 && isRanked;
     const rank = isRanked ? String(i + 1).padStart(2) : info?.blocked ? " !" : " ·";
-    console.log(
+    lines.push(
       tableRow([
         [rank, best ? ["bold", "green"] : isRanked ? null : "dim"],
         [win.label, best ? ["bold", "green"] : isRanked ? null : "dim"],
@@ -851,14 +886,98 @@ function printRanking(ranked, others) {
         [info?.position?.toLocaleString("es-AR") ?? "", null],
         [formatProgress(info?.progress ?? null), "cyan"],
         [info?.queueId ?? "", "dim"],
+        info?.link ? ["link", ["underline", "blue"], info.link] : ["", null],
       ]),
     );
   }
-  console.log(tableLine("└", "┴", "┘"));
+  lines.push(tableLine("└", "┴", "┘"));
+  rankingTable = lines;
+  if (!ticker) showTable(lines); // otherwise the ticker draws it
+}
+
+// On a terminal, the bottom of the output is a live region, redrawn in place: a spinner until
+// the first ranking table, then the latest table with a countdown to the next update. Every other
+// message is printed above it. Elsewhere (e.g. output piped to a file) each table is just printed
+// after the previous one.
+let liveTable = null; // lines now drawn in the live region
+let rankingTable = null; // lines of the latest ranking table
+let nextUpdateAt = 0; // when rankQueue reads the windows next (ms timestamp)
+let ticker = null; // redraws the live region while it's running
+
+// Moves the cursor up to where the live region starts and erases it. Lines wider than the
+// terminal take several rows. A region taller than the terminal can't be fully erased: its top
+// stays in the scrollback.
+function eraseTable() {
+  if (!liveTable || !process.stdout.isTTY) return;
+  const columns = process.stdout.columns || 80;
+  const rows = liveTable.reduce(
+    (n, line) =>
+      n + Math.max(1, Math.ceil(stripVTControlCharacters(line).length / columns)),
+    0,
+  );
+  process.stdout.write(`\r\x1b[${rows}A\x1b[0J`);
+}
+
+function showTable(lines) {
+  eraseTable();
+  liveTable = lines;
+  process.stdout.write(lines.join("\n") + "\n");
+}
+
+// Starts redrawing the live region (only redraws when its text changes, so the table is redrawn
+// once a second, as the countdown ticks).
+function startLive() {
+  if (!process.stdout.isTTY)
+    return log("Waiting for the windows to reach the queue...");
+  const frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+  const started = Date.now();
+  let frame = 0;
+  let drawn = "";
+  ticker = setInterval(() => {
+    const seconds = Math.ceil((nextUpdateAt - Date.now()) / 1000);
+    const next = seconds > 0 ? `next update in ${seconds} s` : "updating...";
+    const lines = rankingTable
+      ? [...rankingTable, styleText("dim", ` ↻ ${next}`)]
+      : [
+          "",
+          styleText("cyan", frames[frame++ % frames.length]) +
+            " Waiting for the windows to reach the queue" +
+            styleText(
+              "dim",
+              ` · ${Math.floor((Date.now() - started) / 1000)} s · ${next}`,
+            ),
+        ];
+    if (lines.join("\n") === drawn) return;
+    drawn = lines.join("\n");
+    showTable(lines);
+  }, 100);
+}
+
+// Stops redrawing the live region and leaves the latest table (without the countdown) printed.
+function stopLive() {
+  if (!ticker) return;
+  clearInterval(ticker);
+  ticker = null;
+  eraseTable();
+  liveTable = null;
+  if (rankingTable) process.stdout.write(rankingTable.join("\n") + "\n");
+}
+
+// Prints above the live table.
+function print(write) {
+  eraseTable();
+  write();
+  if (liveTable && process.stdout.isTTY)
+    process.stdout.write(liveTable.join("\n") + "\n");
+}
+
+function log(message) {
+  print(() => console.log(message));
 }
 
 async function closeAll() {
-  console.log(styleText("dim", "\nClosing browsers..."));
+  stopLive();
+  log(styleText("dim", "\nClosing browsers..."));
   // Some browsers (e.g. Opera) re-parent themselves away from the process we
   // spawned, so find the private-window processes by their profile path instead.
   if (privateProcs.length > 0) {
@@ -917,7 +1036,7 @@ const chromiumScale = Math.min(
   Math.floor((grid.width / CHROMIUM_MIN_WIDTH) * 100) / 100,
 );
 
-console.log(
+log(
   styleText("bold", `Opening ${chromiumLabels.length + firefoxCount} windows`) +
     styleText(
       "dim",
@@ -926,7 +1045,7 @@ console.log(
     ),
 );
 if (values.hidden && firefoxCount > 0)
-  console.log(
+  log(
     styleText("dim", "Firefox windows stay visible: they can't be minimized on Wayland."),
   );
 
@@ -941,9 +1060,10 @@ if (launched.length === 0 && privateProcs.length === 0) {
   console.error(styleText("red", "No browser could be launched."));
   process.exit(1);
 }
-console.log(
+log(
   styleText("bold", "All windows opened.") +
-    styleText("dim", " The ranking is printed every minute. Press Ctrl+C to close them."),
+    styleText("dim", " The ranking is updated every minute. Press Ctrl+C to close them."),
 );
 if (!values["keep-all"]) watchQueue();
+startLive();
 rankQueue();

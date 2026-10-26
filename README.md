@@ -105,24 +105,25 @@ Qué hacer:
 
 ## Ranking de la fila (experimental)
 
-Cada minuto (cada 10 segundos cuando alguna ventana está a un minuto o menos de entrar), el script lee la página de Queue-it de cada ventana y muestra una tabla ordenada por espera, de menor a mayor. Desempatan el progreso y después la posición:
+Mientras las ventanas cargan, la terminal muestra un indicador de carga con los segundos transcurridos. Debajo de la tabla, `↻ next update in 42 s` cuenta los segundos hasta la próxima lectura. Hasta que aparece la primera tabla, el script revisa cada 10 segundos, así que la tabla aparece apenas alguna ventana llega a la fila. Después la actualiza cada minuto (cada 10 segundos cuando alguna ventana está a un minuto o menos de entrar). En cada lectura, el script lee la página de Queue-it de cada ventana y muestra una tabla ordenada por espera, de menor a mayor. Desempatan el progreso y después la posición:
 
 ```
 Queue status · 13:21:05 · 4 of 6 windows ranked
-┌────┬────────────────────┬────────────┬───────────┬────────────┬──────────────────────────────────────┐
-│ #  │ Window             │ Wait       │ Position  │ Progress   │ Queue ID                             │
-├────┼────────────────────┼────────────┼───────────┼────────────┼──────────────────────────────────────┤
-│  1 │ chrome #4          │ < 1 min    │           │ ▰▰▰▰▰  98% │ 038e9af4-c803-4a00-9445-2896f3fe2761 │
-│  2 │ edge #1            │ 34 min     │ 45.678    │ ▰▰▱▱▱  41% │ aaaaaaaa-2222-3333-4444-555555555555 │
-│  3 │ chrome #2          │ > 1 h      │           │ ▱▱▱▱▱   5% │ d93af6d7-25dc-4fd1-aa05-44df7580f129 │
-│  4 │ chrome #1          │ > 1 h      │           │ ▱▱▱▱▱   2% │ c8eb54ae-96d9-4af9-9b11-2aa4970944fa │
-│  ! │ brave private #1   │ CAPTCHA    │           │            │                                      │
-│  · │ firefox private #1 │ no data    │           │            │                                      │
-└────┴────────────────────┴────────────┴───────────┴────────────┴──────────────────────────────────────┘
+┌────┬────────────────────┬────────────┬───────────┬────────────┬──────────────────────────────────────┬──────┐
+│ #  │ Window             │ Wait       │ Position  │ Progress   │ Queue ID                             │ Link │
+├────┼────────────────────┼────────────┼───────────┼────────────┼──────────────────────────────────────┼──────┤
+│  1 │ chrome #4          │ < 1 min    │           │ ▰▰▰▰▰  98% │ 038e9af4-c803-4a00-9445-2896f3fe2761 │ link │
+│  2 │ edge #1            │ 34 min     │ 45.678    │ ▰▰▱▱▱  41% │ aaaaaaaa-2222-3333-4444-555555555555 │ link │
+│  3 │ chrome #2          │ > 1 h      │           │ ▱▱▱▱▱   5% │ d93af6d7-25dc-4fd1-aa05-44df7580f129 │ link │
+│  4 │ chrome #1          │ > 1 h      │           │ ▱▱▱▱▱   2% │ c8eb54ae-96d9-4af9-9b11-2aa4970944fa │ link │
+│  ! │ brave private #1   │ CAPTCHA    │           │            │                                      │      │
+│  · │ firefox private #1 │ no data    │           │            │                                      │      │
+└────┴────────────────────┴────────────┴───────────┴────────────┴──────────────────────────────────────┴──────┘
 ```
 
-En la terminal la mejor ventana sale en verde, las que están a menos de un minuto también, y las bloqueadas en rojo. Antes de que abra la fila, las ventanas aparecen como `prequeue`. La tabla mide unos 105 caracteres de ancho: con la terminal más angosta se corta.
+En la terminal la mejor ventana sale en verde, las que están a menos de un minuto también, y las bloqueadas en rojo. Antes de que abra la fila, las ventanas aparecen como `prequeue`. La tabla no se repite: queda siempre al pie de la terminal y se actualiza en el lugar, y los demás mensajes (avisos, ventanas que se cierran) aparecen arriba de ella. Mide unos 112 caracteres de ancho, así que conviene una terminal al menos así de ancha. Si la tabla es más alta que la terminal, la parte de arriba de las tablas anteriores queda en el historial.
 
+- **Link de cada fila:** la columna `Link` es un hipervínculo de terminal con la URL de ese lugar en la fila (la URL de Queue-it con `q=<queue ID>`, lo mismo que copia el botón "Copiar mi enlace"). En GNOME Terminal, clic derecho → "Copiar la dirección del enlace", o Ctrl+clic para abrirlo. Abrirlo en otro navegador continúa **el mismo lugar**, no uno nuevo: no lo compartas.
 - **No genera tráfico:** solo lee páginas que ya están cargadas, sin peticiones extra a Queue-it ni a Boca.
 - **Qué lee:** primero los elementos visibles de la página (en la de Boca, `#MainPart_lbWhichIsIn` para la espera, `#MainPart_lbQueueNumber` para la posición y `#hlLinkToQueueTicket2` para el ID). Después, el estado interno de Queue-it (`window.queueViewModel.ticket`), que tiene la espera, la posición y el progreso aunque la plantilla los oculte. Por último, el texto de la página ("dentro de: 34 minutos"). "Más de una hora" se muestra como `> 1 h`.
 - **CAPTCHA o bloqueo:** si una ventana muestra un iframe de captcha o textos como "too many requests" o "acceso bloqueado", aparece con `!` y la terminal avisa que la revises a mano. Si son varias, cerrá algunas para bajar la carga.
